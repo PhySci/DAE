@@ -93,7 +93,7 @@ class DeepClassifier:
 
             for epoch in range(self.dae_epoch): #enumerate(noise_list):
                 print('Epoch: {epoch}'.format(epoch=epoch))
-                noise = 0.1
+                noise = 0.0
                 loss = list()
                 batch_num = np.ceil(x.shape[0] / self.batch_size).astype(int)
                 for i in range(batch_num):
@@ -134,7 +134,7 @@ class DeepClassifier:
                                              name='clf_optimizer_op'). \
                 minimize(self.clf_loss, var_list=tf.get_collection('clf'))
 
-    def train_clf(self, X, y, X_val=None, y_val=None, restart = False, L2 = 0.005):
+    def train_clf(self, X, y, X_val=None, y_val=None, restart=False, L2=0.005):
 
         self.logger.debug('Classifier training')
         merged = tf.summary.merge_all()
@@ -251,15 +251,29 @@ class DeepClassifier:
                 tf.summary.histogram('nn_layer2', a2)
         return y_pr
 
-    def get_batch(self, features, noise_level = 0.1):
+    def get_batch(self, features, noise_level=0.1):
+        """
+        Return corrupted training minibatch
+        :param features: original dataset
+        :param noise_level: corruption degree
+        :return:
+        """
         n_features = features.shape[1]
+        # random choose of rows being corrupted
         idx = np.random.randint(0, features.shape[0], self.batch_size)
+        # randomly choose training minibatch
         new_set = features.iloc[idx].values
+        # number of values being corrupted
         n_perm = int(noise_level*self.batch_size*n_features)
-        rows = list(np.random.randint(0, self.batch_size, n_perm))
+        # randomly choose columns to be corrupted
         cols = list(np.random.randint(0, n_features, n_perm))
+        # randomly choose initial rows to be corrupted
+        rows = list(np.random.randint(0, self.batch_size, n_perm))
+        # randomly choose new position of values
         new_rows = list(np.random.randint(0, features.shape[0], n_perm))
+        # copy minibatch
         noise_set = new_set.copy()
+        # corrupt minibatch
         noise_set[rows, cols] = features.values[new_rows, cols]
         return new_set, noise_set
 
