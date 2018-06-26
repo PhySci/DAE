@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import tensorflow as tf
 import os
+import time
 from sklearn.metrics import roc_auc_score
 import logging
 
@@ -10,7 +11,8 @@ class DeepClassifier:
 
     def __init__(self, dae_lr=0.001, nn_lr=0.01, dae_decay=0.99, nn_decay=0.99, L2 = 0.005, batch_size=512,
                  features = 345, dae_hidden = [1500, 1500, 1500], clf_hidden = [1000, 1000],
-                 restart=False, verbose=True, keep_prob=1, name = './model/DAE_model'):
+                 restart=False, verbose=True, keep_prob=1, name = './model/DAE_model',
+                 cat_features=[], bin_features = [], num_features=[], ohe = None):
         """
         Create an instance
         :param dae_lr:
@@ -35,8 +37,13 @@ class DeepClassifier:
         self.L2 = L2
         self.verbose = True
         self.keep_prob = keep_prob
-        self.dae_epoch = 100
-        self.clf_epoch = 100
+        self.dae_epoch = 32
+        self.clf_epoch = 32
+
+        self.cat_features = cat_features
+        self.num_features = num_features
+        self.bin_features = bin_features
+        self.ohe = ohe
 
         self.pth = name
 
@@ -80,26 +87,28 @@ class DeepClassifier:
                                              name='dae_optimizer_op'). \
                 minimize(self.dae_loss, var_list=tf.get_collection('DAE'))
 
-    def train_dae(self, x):
+    def train_dae(self, x, noise = 0.1):
         """
         Train Denoising Auto Encoder
         :param X: dataset
         :return:
         """
         noise_list = np.linspace(0.001, 0.1, self.dae_epoch)
+        np.random.seed(seed=int(time.time()))
+
+
         with tf.Session() as sess:
             self.saver.restore(sess, self.pth)
             train_writer = tf.summary.FileWriter('./train/dae', sess.graph)
 
             for epoch in range(self.dae_epoch): #enumerate(noise_list):
                 print('Epoch: {epoch}'.format(epoch=epoch))
-                noise = 0.0
                 loss = list()
                 batch_num = np.ceil(x.shape[0] / self.batch_size).astype(int)
                 for i in range(batch_num):
-                    print('{i}/{n}'.format(i=i, n=batch_num))
+                    #print('{i}/{n}'.format(i=i, n=batch_num))
                     batch, noise_batch = self.get_batch(x, noise_level=noise)
-                    noise_l = np.mean(np.abs(batch-noise_batch))
+                    noise_std = np.mean(np.abs(batch-noise_batch))
                     feed_dict = {self.ref_features: batch,
                                  self.inp_features: noise_batch,
                                  self.keep_prob_ph: 1}
@@ -111,7 +120,7 @@ class DeepClassifier:
                 dae_summary.value.add(tag='DAE_train/loss_mean', simple_value=np.array(loss).mean())
                 dae_summary.value.add(tag='DAE_train/loss_std', simple_value=np.array(loss).std())
                 dae_summary.value.add(tag='DAE_train/noise', simple_value=noise)
-                dae_summary.value.add(tag='DAE_train/noise_diff', simple_value=noise_l)
+                dae_summary.value.add(tag='DAE_train/noise_diff', simple_value=noise_std)
 
                 train_writer.add_summary(sess.run(tf.summary.merge_all(), feed_dict=feed_dict), epoch)
                 train_writer.add_summary(dae_summary, epoch)
@@ -140,13 +149,14 @@ class DeepClassifier:
         merged = tf.summary.merge_all()
         with tf.Session() as sess:
             train_writer = tf.summary.FileWriter('./train/clf', sess.graph)
-            if restart:
-                tf.initialize_variables(tf.get_collection('clf'))
             self.saver.restore(sess, self.pth)
+            if restart:
+                print('Reinit classifier')
+                tf.initialize_variables(tf.get_collection('clf'))
             for epoch in range(self.clf_epoch):
                 loss = []
                 for i in range(np.ceil(X.shape[0] / self.batch_size).astype(int)):
-                    batch_x, batch_y = get_train_batch(X, y, batch_size=self.batch_size)
+                    batch_x, batch_y = self.get_train_batch(X, y, batch_size=self.batch_size)
                     feed_dict = {self.inp_features: batch_x,
                                  self.labels: batch_y,
                                  self.keep_prob_ph: self.keep_prob}
@@ -160,8 +170,10 @@ class DeepClassifier:
                 train_writer.add_summary(sess.run(tf.summary.merge_all(), feed_dict=feed_dict), epoch)
                 train_writer.add_summary(clf_summary, epoch)
 
-                if (epoch % 2 ==0) or epoch==(self.clf_epoch-1):
-                    y_pr = sess.run(self.graph, feed_dict={self.inp_features: X_val, self.keep_prob_ph: 1})
+                if True: #(epoch % 2 ==0) or epoch==(self.clf_epoch-1):
+                    val_set, val_label = self.get_train_batch(X_val, y_val)
+
+                    y_pr = sess.run(self.graph, feed_dict={self.inp_features: val_set, self.keep_prob_ph: 1})
                     msg = 'ROC-AUC is {v: 2.3f}'.format(v=roc_auc_score(y_val, y_pr))
                     self.show_msg(msg)
                     self.logger.debug(self.saver.save(sess, self.pth))
@@ -251,31 +263,45 @@ class DeepClassifier:
                 tf.summary.histogram('nn_layer2', a2)
         return y_pr
 
-    def get_batch(self, features, noise_level=0.1):
+    def get_batch(self, df, noise_level=0.1):
         """
         Return corrupted training minibatch
-        :param features: original dataset
+        :param df: original dataset
         :param noise_level: corruption degree
         :return:
         """
-        n_features = features.shape[1]
-        # random choose of rows being corrupted
-        idx = np.random.randint(0, features.shape[0], self.batch_size)
-        # randomly choose training minibatch
-        new_set = features.iloc[idx].values
-        # number of values being corrupted
-        n_perm = int(noise_level*self.batch_size*n_features)
-        # randomly choose columns to be corrupted
-        cols = list(np.random.randint(0, n_features, n_perm))
-        # randomly choose initial rows to be corrupted
+
+        # Get random subset
+        batch = df.sample(n=self.batch_size).copy()
+
+        # add noise to numerical features
+        original_num_features = batch[self.num_features].values
+        noisy_num_features = original_num_features.copy() + noise_level*np.random.rand(self.batch_size, len(self.num_features))
+
+        # add noise to binary features
+        original_bin_features = batch[self.bin_features].values
+        noisy_bin_features = original_bin_features.copy() + np.random.choice(a=[0, 1],
+                                                     size=(self.batch_size, len(self.bin_features)),
+                                                     p=[1-noise_level, noise_level])
+        noisy_bin_features = noisy_bin_features % 2
+
+        # add noise to categorical features
+        original_cat_features = batch[self.cat_features].values
+        noisy_cat_features = original_cat_features.copy()
+
+        n_cat_features = len(self.cat_features)
+        n_perm = int(noise_level*self.batch_size*n_cat_features)
+        cols = list(np.random.randint(0, n_cat_features, n_perm))
         rows = list(np.random.randint(0, self.batch_size, n_perm))
-        # randomly choose new position of values
-        new_rows = list(np.random.randint(0, features.shape[0], n_perm))
-        # copy minibatch
-        noise_set = new_set.copy()
-        # corrupt minibatch
-        noise_set[rows, cols] = features.values[new_rows, cols]
-        return new_set, noise_set
+        new_rows = list(np.random.randint(0, self.batch_size, n_perm))
+        noisy_cat_features[rows, cols] = noisy_cat_features[new_rows, cols]
+
+        noisy_cat_features = self.ohe.transform(noisy_cat_features)
+        original_cat_features = self.ohe.transform(original_cat_features)
+        original_batch = np.concatenate((original_num_features, original_bin_features, original_cat_features), axis = 1)
+        noisy_batch = np.concatenate((noisy_num_features, noisy_bin_features, noisy_cat_features), axis=1)
+
+        return original_batch, noisy_batch
 
     def predict(self, X):
         with tf.Session() as sess:
@@ -288,9 +314,22 @@ class DeepClassifier:
         if self.verbose:
             print(msg)
 
-def get_train_batch(X, y, batch_size = 100):
-    idx = np.random.randint(0, X.shape[0], batch_size)
-    return X.iloc[idx].values, y.iloc[idx].values[:, np.newaxis]
+    def get_train_batch(self, df, labels, batch_size = None):
+
+        if batch_size is not None:
+            idx = np.random.randint(0, df.shape[0], batch_size)
+            X = df.iloc[idx]
+            y = labels.iloc[idx]
+        else:
+            X = df
+            y = labels
+
+        val_num_features = X[self.num_features]
+        val_bin_features = X[self.bin_features]
+        val_cat_features = self.ohe.transform(X[self.cat_features])
+        batch = np.concatenate((val_num_features, val_bin_features, val_cat_features), axis=1)
+
+        return batch, y[:, np.newaxis]
 
 
 
