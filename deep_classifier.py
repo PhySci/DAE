@@ -37,7 +37,7 @@ class DeepClassifier:
         self.L2 = L2
         self.verbose = True
         self.keep_prob = keep_prob
-        self.dae_epoch = 12
+        self.dae_epoch = 128
         self.clf_epoch = 12
 
         self.cat_features = cat_features
@@ -106,8 +106,7 @@ class DeepClassifier:
                 print('Epoch: {epoch}'.format(epoch=epoch))
                 loss = list()
                 for i, ids in enumerate(np.array_split(x.index.tolist(), batch_num)):
-                    print(i)
-                    batch, noise_batch = self.get_corrupted_data(x.loc[ids, :], noise_level=noise)
+                    batch, noise_batch = self.get_corrupted_data(x.loc[ids, :].copy(), noise_level=noise)
                     noise_std = np.mean(np.abs(batch-noise_batch))
                     feed_dict = {self.ref_features: batch,
                                  self.inp_features: noise_batch,
