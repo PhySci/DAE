@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 import os
 import time
+import datetime
 from sklearn.metrics import roc_auc_score
 import logging
 
@@ -37,7 +38,7 @@ class DeepClassifier:
         self.L2 = L2
         self.verbose = True
         self.keep_prob = keep_prob
-        self.dae_epoch = 128
+        self.dae_epoch = 1024
         self.clf_epoch = 12
 
         self.cat_features = cat_features
@@ -95,18 +96,19 @@ class DeepClassifier:
         :return:
         """
         noise_list = np.linspace(0.001, 0.1, self.dae_epoch)
-        #np.random.seed(seed=int(time.time()))
+        np.random.seed(seed=int(time.time()))
         batch_num = np.floor(x.shape[0] / self.batch_size).astype(int)
 
         with tf.Session() as sess:
             self.saver.restore(sess, self.pth)
-            train_writer = tf.summary.FileWriter('./train/dae', sess.graph)
+            train_writer = tf.summary.FileWriter('./train/dae/'+datetime.datetime.now().strftime("%Y-%m-%d-%H-%M"),
+                                                 sess.graph)
 
-            for epoch in range(self.dae_epoch): #enumerate(noise_list):
+            for epoch in range(self.dae_epoch):
                 print('Epoch: {epoch}'.format(epoch=epoch))
                 loss = list()
                 for i, ids in enumerate(np.array_split(x.index.tolist(), batch_num)):
-                    batch, noise_batch = self.get_corrupted_data(x.loc[ids, :].copy(), noise_level=noise)
+                    batch, noise_batch = self.get_corrupted_data(x.loc[ids, :], noise_level=noise)
                     noise_std = np.mean(np.abs(batch-noise_batch))
                     feed_dict = {self.ref_features: batch,
                                  self.inp_features: noise_batch,
@@ -132,7 +134,7 @@ class DeepClassifier:
     def get_clf_loss(self, y):
         with tf.name_scope('clf_loss'):
             y_pr = tf.get_default_graph().get_tensor_by_name("NN/layer2/output:0")
-            loss_sample =  tf.reduce_mean(tf.losses.log_loss(y, y_pr), name='clf_loss')
+            loss_sample = tf.reduce_mean(tf.losses.log_loss(y, y_pr), name='clf_loss')
             loss_reg = tf.nn.l2_loss(tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES))
             return loss_sample+self.L2*loss_reg
 
@@ -142,59 +144,77 @@ class DeepClassifier:
                                              name='clf_optimizer_op'). \
                 minimize(self.clf_loss, var_list=tf.get_collection('clf'))
 
-    def train_clf(self, X, y, X_val=None, y_val=None, restart=False, L2=0.005):
+    def train_clf(self, df, y, df_val=None, y_val=None, restart=False, L2=0.005):
         """
         Train classification subpart of the model
-        :param X: train dataset
+        :param df: train dataset
         :param y: train labels
-        :param X_val: validation dataset
+        :param df_val: validation dataset
         :param y_val: validation labels
         :param restart: Should the classifier be reinitialized?
         :param L2: regularization term
         :return:
         """
         self.logger.debug('Classifier training')
+        batch_num = np.floor(df.shape[0] / self.batch_size).astype(int)
+        x = self.get_train_batch(df)
+        x_val = self.get_train_batch(df_val)
         merged = tf.summary.merge_all()
         with tf.Session() as sess:
-            train_writer = tf.summary.FileWriter('./train/clf', sess.graph)
+            train_writer = tf.summary.FileWriter('./train/clf/'+datetime.datetime.now().strftime("%Y-%m-%d-%H-%M"),
+                                                 sess.graph)
             self.saver.restore(sess, self.pth)
             if restart:
                 print('Reinit classifier')
-                tf.initialize_variables(tf.get_collection('clf'))
+                reinit_op = tf.variables_initializer(tf.get_collection('clf'), name='reset_clf')
+                sess.run(reinit_op)
             for epoch in range(self.clf_epoch):
                 loss = []
-                for i in range(np.ceil(X.shape[0] / self.batch_size).astype(int)):
-                    batch_x, batch_y = self.get_train_batch(X, y, batch_size=self.batch_size)
-                    feed_dict = {self.inp_features: batch_x,
-                                 self.labels: batch_y,
+                for i, ids in enumerate(np.array_split(df.index.tolist(), batch_num)):
+                    feed_dict = {self.inp_features: x.loc[ids, :],
+                                 self.labels: y.loc[ids][:, np.newaxis],
                                  self.keep_prob_ph: self.keep_prob}
                     _, t = sess.run([self.clf_optimizer, self.clf_loss], feed_dict=feed_dict)
                     loss.append(t)
+
                 # add info
                 clf_summary = tf.Summary()
                 clf_summary.value.add(tag='clf_train/loss_mean', simple_value=np.array(loss).mean())
                 clf_summary.value.add(tag='clf_train/loss_std', simple_value=np.array(loss).std())
                 clf_summary.value.add(tag='clf_train/keep_prob', simple_value=self.keep_prob)
-                train_writer.add_summary(sess.run(tf.summary.merge_all(), feed_dict=feed_dict), epoch)
+
+                # estimate quality of the model
+                y_pr, report = sess.run([self.graph, tf.summary.merge_all()],
+                                        feed_dict={self.inp_features: x_val,
+                                                   self.labels: y_val[:, np.newaxis],
+                                                   self.keep_prob_ph: 1})
+
+                clf_summary.value.add(tag='clf_train/ROC_AUC', simple_value=roc_auc_score(y_val, y_pr))
+                train_writer.add_summary(report, epoch)
                 train_writer.add_summary(clf_summary, epoch)
 
-                if True: #(epoch % 2 ==0) or epoch==(self.clf_epoch-1):
-                    val_set, val_label = self.get_train_batch(X_val, y_val)
-
-                    y_pr = sess.run(self.graph, feed_dict={self.inp_features: val_set, self.keep_prob_ph: 1})
-                    msg = 'ROC-AUC is {v: 2.3f}'.format(v=roc_auc_score(y_val, y_pr))
-                    self.show_msg(msg)
+                if (epoch % 2 ==0) or epoch==(self.clf_epoch-1):
                     self.logger.debug(self.saver.save(sess, self.pth))
 
-            print(self.saver.save(sess, self.pth))
+
+    #if True: #(epoch % 2 ==0) or epoch==(self.clf_epoch-1):
+                #    y_pr = sess.run(self.graph, feed_dict={self.inp_features: x_val, self.keep_prob_ph: 1})
+                #    msg = 'ROC-AUC is {v: 2.3f}'.format(v=roc_auc_score(y_val, y_pr))
+                #    self.show_msg(msg)
+                #
+
 
     def build_graph(self, inp):
-        # Define DAE
+        """
+        Build calculation graph
+        :param inp: input features
+        :return: classification labels
+        """
         with tf.name_scope('DAE'):
             with tf.name_scope('layer0'):
                 dae_w0 = tf.get_variable(shape=[self.dae_size[0], self.dae_size[1]], name='dae_w0')
                 dae_b0 = tf.get_variable(shape=[self.dae_size[1]], name='dae_b0')
-                dae_layer0 = tf.nn.relu(tf.add(tf.matmul(inp, dae_w0), dae_b0), name='output')
+                dae_layer0 = tf.nn.leaky_relu(tf.add(tf.matmul(inp, dae_w0), dae_b0), name='output')
                 tf.add_to_collection("DAE", dae_w0)
                 tf.add_to_collection("DAE", dae_b0)
 
@@ -205,7 +225,7 @@ class DeepClassifier:
             with tf.name_scope('layer1'):
                 dae_w1 = tf.get_variable(shape=[self.dae_size[1], self.dae_size[2]], name='dae_w1')
                 dae_b1 = tf.get_variable(shape=[self.dae_size[2]], name='dae_b1')
-                dae_layer1 = tf.nn.relu(tf.add(tf.matmul(dae_layer0, dae_w1), dae_b1), name='output')
+                dae_layer1 = tf.nn.leaky_relu(tf.add(tf.matmul(dae_layer0, dae_w1), dae_b1), name='output')
                 tf.add_to_collection("DAE", dae_w1)
                 tf.add_to_collection("DAE", dae_b1)
 
@@ -216,7 +236,7 @@ class DeepClassifier:
             with tf.name_scope('layer2'):
                 dae_w2 = tf.get_variable(shape=[self.dae_size[2], self.dae_size[3]], name='dae_w2')
                 dae_b2 = tf.get_variable(shape=[self.dae_size[3]], name='dae_b2')
-                dae_layer2 = tf.nn.relu(tf.add(tf.matmul(dae_layer1, dae_w2), dae_b2), name='output')
+                dae_layer2 = tf.nn.leaky_relu(tf.add(tf.matmul(dae_layer1, dae_w2), dae_b2), name='output')
                 tf.add_to_collection("DAE", dae_w2)
                 tf.add_to_collection("DAE", dae_b2)
 
@@ -242,33 +262,34 @@ class DeepClassifier:
             with tf.name_scope('layer0'):
                 nn_b0 = tf.get_variable(shape=[self.nn_size[1]], name='clf_b0')
                 nn_w0 = tf.get_variable(shape=[self.nn_size[0], self.nn_size[1]], name='clf_w0', regularizer=regularizer)
-                a0 = tf.nn.relu(tf.add(tf.matmul(nn_inp, nn_w0), nn_b0), name='output')
+                a0 = tf.nn.leaky_relu(tf.add(tf.matmul(nn_inp, nn_w0), nn_b0), name='output')
                 nn_layer0 = tf.nn.dropout(a0, self.keep_prob_ph, name='dropout_0')
                 tf.add_to_collection("clf", nn_w0)
                 tf.add_to_collection("clf", nn_b0)
-                tf.summary.histogram('nn_w0', nn_w0)
-                tf.summary.histogram('nn_b0', nn_b0)
-                tf.summary.histogram('nn_layer0', a0)
+                tf.summary.histogram('W', nn_w0)
+                tf.summary.histogram('b', nn_b0)
+                tf.summary.histogram('output', a0)
             with tf.name_scope('layer1'):
                 nn_b1 = tf.get_variable(shape=[self.nn_size[2]], name='clf_b1')
                 nn_w1 = tf.get_variable(shape=[self.nn_size[1], self.nn_size[2]], name='clf_w1', regularizer=regularizer)
-                a1 = tf.nn.relu(tf.add(tf.matmul(nn_layer0, nn_w1), nn_b1), name='output')
+                a1 = tf.nn.leaky_relu(tf.add(tf.matmul(nn_layer0, nn_w1), nn_b1), name='output')
                 nn_layer1 = tf.nn.dropout(a1, keep_prob=self.keep_prob_ph, name='dropout_1')
                 tf.add_to_collection("clf", nn_w1)
                 tf.add_to_collection("clf", nn_b1)
-                tf.summary.histogram('nn_w1', nn_w1)
-                tf.summary.histogram('nn_b1', nn_b1)
-                tf.summary.histogram('nn_layer1', a1)
+                tf.summary.histogram('W', nn_w1)
+                tf.summary.histogram('b', nn_b1)
+                tf.summary.histogram('output', a1)
             with tf.name_scope('layer2'):
                 nn_b2 = tf.get_variable(shape=[self.nn_size[3]], name='clf_b2')
                 nn_w2 = tf.get_variable(shape=[self.nn_size[2], self.nn_size[3]], name='clf_w2', regularizer=regularizer)
-                a2 = tf.nn.sigmoid(tf.add(tf.matmul(nn_layer1, nn_w2), nn_b2), name='output')
-                y_pr = tf.nn.dropout(a2, keep_prob=self.keep_prob_ph, name='dropout_2')
+                a2 = tf.add(tf.matmul(nn_layer1, nn_w2), nn_b2, name='preactivation')
+                y_pr = tf.nn.sigmoid(a2, name='output')
                 tf.add_to_collection("clf", nn_w2)
                 tf.add_to_collection("clf", nn_b2)
-                tf.summary.histogram('nn_w2', nn_w2)
-                tf.summary.histogram('nn_b2', nn_b2)
-                tf.summary.histogram('nn_layer2', a2)
+                tf.summary.histogram('W', nn_w2)
+                tf.summary.histogram('b', nn_b2)
+                tf.summary.histogram('a', a2)
+                tf.summary.histogram('prediction', y_pr)
         return y_pr
 
     def get_corrupted_data(self, df, noise_level=0.1):
@@ -284,24 +305,25 @@ class DeepClassifier:
 
         # Get random subset
         arr_size = df.shape
-        original_num_features = df[self.num_features].values
-        original_bin_features = df[self.bin_features].values
+        original_num_features = df[self.num_features].copy()
+        original_bin_features = df[self.bin_features].copy()
         original_batch = np.concatenate((original_num_features,
                                          original_bin_features,
-                                         self.ohe.transform(df[self.cat_features].values)),
+                                         self.ohe.transform(df[self.cat_features])),
                                         axis=1)
 
         # add noise to numerical features
-        noisy_num_features = original_num_features.copy() + noise_level*np.random.rand(arr_size[0],len(self.num_features))
+        noisy_num_features = original_num_features + noise_level*np.random.rand(arr_size[0],len(self.num_features))
 
         # add noise to binary features
-        noisy_bin_features = original_bin_features.copy() + np.random.choice(a=[0, 1],
+        noisy_bin_features = original_bin_features + np.random.choice(a=[0, 1],
                                                      size=(arr_size[0], len(self.bin_features)),
                                                      p=[1-noise_level, noise_level])
         noisy_bin_features = noisy_bin_features % 2
 
         # add noise to categorical features
-        noisy_cat_features = df[self.cat_features].values
+
+        noisy_cat_features = df[self.cat_features].copy().values
 
         n_cat_features = len(self.cat_features)
         n_perm = int(noise_level*self.batch_size*n_cat_features)
@@ -336,25 +358,14 @@ class DeepClassifier:
         :param i: chunk number
         :return:
         """
+        pass
 
-
-    def get_train_batch(self, df, labels, batch_size=None):
-
-        if batch_size is not None:
-            idx = np.random.randint(0, df.shape[0], batch_size)
-            X = df.iloc[idx]
-            y = labels.iloc[idx]
-        else:
-            X = df
-            y = labels
-
-        val_num_features = X[self.num_features]
-        val_bin_features = X[self.bin_features]
-        val_cat_features = self.ohe.transform(X[self.cat_features])
+    def get_train_batch(self, df):
+        val_num_features = df[self.num_features]
+        val_bin_features = df[self.bin_features]
+        val_cat_features = self.ohe.transform(df[self.cat_features])
         batch = np.concatenate((val_num_features, val_bin_features, val_cat_features), axis=1)
-
-        return batch, y[:, np.newaxis]
-
+        return pd.DataFrame(batch, index=df.index)
 
 
 
